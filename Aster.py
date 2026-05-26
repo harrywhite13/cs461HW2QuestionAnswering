@@ -1,11 +1,13 @@
 import argparse
 import math
 import time
-
+from tqdm.notebook import tqdm as tdqm
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2TokenizerFast
+import os
 
 class GPT2Attention(nn.Module):
     def __init__(self, d_model, heads, max_seq_len, attn_dropout=0.0, resid_dropout=0.0):
@@ -125,7 +127,7 @@ class TransformerGPT(nn.Module):
 
 
 def load_model_best_state_dict(path):
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu",weights_only=False)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
@@ -147,6 +149,42 @@ def my_tokenizer(path, tokenizer, max_tokens):
                 for ids in encoded:
                     indices.append(int(ids))
     return indices
+
+def Tokenize(opt):
+    #precomputing tokenizations
+    cnt=0
+    opt.train_tokenized = []
+    opt.train_labels = []
+    opt.valid_tokenized = []
+    opt.valid_labels = []
+    opt.test_tokenized = []
+    opt.test_labels = []
+
+    for data in [opt.train, opt.valid, opt.test]:
+        for question in tdqm(data, desc="Precomputing tokenizations"):
+            tokenized = []
+            fact = "" if opt.zero_shot else question['fact']
+            text = opt.tokenizer(fact + " " + question['stem'] + " ", add_special_tokens=False)["input_ids"]
+            choicestart = len(text)
+            #FIRST IN LIST IS LENGTH OF PROMPT
+            text.insert(0,choicestart)
+            #iter through options
+            for option in ["A", "B", "C", "D"]:
+                answerchoice = opt.tokenizer(question[option], add_special_tokens=False)["input_ids"]
+                tokenized.append(text + answerchoice)
+            #tokenize
+            label = np.argmax([1 if x == question['Answer'] else 0 for x in ["A", "B", "C", "D"]])
+            
+            if cnt==0:
+                opt.train_tokenized.append(tokenized)
+                opt.train_labels.append(label)
+            elif cnt==1:
+                opt.valid_tokenized.append(tokenized)
+                opt.valid_labels.append(label)
+            elif cnt==2:
+                opt.test_tokenized.append(tokenized)
+                opt.test_labels.append(label)
+        cnt+=1
 
 @torch.no_grad()
 def test_model(model, indices, opt, epoch=0, device=None):
@@ -229,12 +267,98 @@ def read_obqa(file_name):
             d['B'] = tokens[3]
             d['C'] = tokens[4]
             d['D'] = tokens[5]
-            d['Answer'] = tokens[6]   
+            d['Answer'] = tokens[6]
             data.append(d)
     for i in range(5):
         print(i,data[i])
     print('data: %d' % (len(data)))
     return(data)
+
+def train(model, opt):
+    scaler = torch.amp.GradScaler()
+    prevaccuracy = 0
+    model = model.to(opt.device)
+    #epoch loop
+    for epoch in tdqm(range(opt.epochs), desc="epochs"):
+        #shuffle data
+        ind = np.random.permutation(len(opt.train_tokenized))
+        opt.train_tokenized = [opt.train_tokenized[i] for i in ind]
+        opt.train_labels = [opt.train_labels[i] for i in ind]
+        #batch
+        for idx in tdqm(range(0,len(opt.train_labels),opt.batchsize), desc=f"Batches"):
+            #define batch
+            batch_examples = opt.train_tokenized[idx: idx + opt.batchsize]
+            batch_labels = torch.tensor(opt.train_labels[idx: idx + opt.batchsize]).to(opt.device)
+            #flatten for gpu pass
+            allexamples = [torch.tensor(option[1:]) for example in batch_examples for option in example]
+            choicestart = torch.tensor([option[0] for example in batch_examples for option in example], device=opt.device)
+            #add padding so everything is the same legnth
+            input_ids = torch.nn.utils.rnn.pad_sequence(allexamples, batch_first=True, padding_value=0).to(opt.device)
+            attention_mask = (input_ids != 0).long()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                x,logits = model(input_ids, attention_mask=attention_mask)
+                #shift back by one so that model logits are at the same index as the tokens in the sequence
+                logits = logits[:, :-1, :]
+                labels = input_ids[:, 1:]
+                log_probs = F.log_softmax(logits,dim=-1)
+                #compute loss
+                token_log_probs = -F.cross_entropy(logits.reshape(-1, logits.size(-1)),labels.reshape(-1),reduction='none').view(labels.shape)
+                positions = torch.arange(token_log_probs.size(1), device=opt.device).unsqueeze(0)
+                mask = (positions >= (choicestart.unsqueeze(1) - 1)).float() 
+                token_log_probs = token_log_probs * mask
+                choice_scores = token_log_probs.sum(dim=1)/mask.sum(dim=1)
+                choice_scores = choice_scores.view(len(batch_examples), 4)
+                loss = F.cross_entropy(choice_scores, batch_labels)
+            opt.optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(opt.optimizer)
+            scaler.update()
+
+        accuracy = test(model, opt, validation = True)
+        if accuracy < prevaccuracy:
+            #Early Stopping based on validation set
+            break
+        prevaccuracy = accuracy
+        print("Accuracy is ", accuracy)
+        #save model weights
+        os.makedirs("GPTQAweights", exist_ok = True)
+        intacc = int(accuracy * 100)
+        filename = f"GPTQAweights/model_weights_zero_shot_{intacc}.pt" if opt.zero_shot else f"GPTQAweights/model_weights_{intacc}.pt"
+        torch.save(model.state_dict(), filename)
+        torch.cuda.empty_cache()
+
+def test(model, opt, validation = False):
+    examples = opt.valid_tokenized if validation else opt.test_tokenized
+    alllabels = opt.valid_labels if validation else opt.test_labels
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for  idx in tdqm(range(0,len(examples),opt.batchsize), desc=f"Evaluation on {"test" if not validation else "validation"} set"):
+           #define batch
+            batch_examples = examples[idx: idx + opt.batchsize]
+            batch_labels = torch.tensor(alllabels[idx: idx + opt.batchsize]).to(opt.device)
+            #flatten for single pass and move to gpu
+            allexamples = [torch.tensor(option[1:]) for example in batch_examples for option in example]
+            choicestart = torch.tensor([option[0] for example in batch_examples for option in example], device=opt.device)
+            #flatten for gpu pass
+            allexamples = [torch.tensor(option[1:]) for example in batch_examples for option in example]
+            choicestart = torch.tensor([option[0] for example in batch_examples for option in example], device=opt.device)
+            #add padding so everything is the same legnth
+            input_ids = torch.nn.utils.rnn.pad_sequence(allexamples, batch_first=True, padding_value=0).to(opt.device)
+            attention_mask = (input_ids != 0).long()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                x,logits = model(input_ids, attention_mask=attention_mask)
+                logits = logits[:, :-1, :]
+                labels = input_ids[:, 1:]
+                token_log_probs = -F.cross_entropy(logits.reshape(-1, logits.size(-1)),labels.reshape(-1),reduction='none',).view(labels.shape)
+                positions = torch.arange(token_log_probs.size(1), device=opt.device).unsqueeze(0)
+                mask = (positions >= (choicestart.unsqueeze(1) - 1)).float() 
+                token_log_probs = token_log_probs * mask
+                choice_scores = token_log_probs.sum(dim=1)/mask.sum(dim=1)
+                choice_scores = choice_scores.view(len(batch_examples), 4)
+                preds = choice_scores.argmax(dim=1)
+                correct+=(preds==batch_labels).sum().item()            
+    return correct/len(alllabels)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -252,20 +376,29 @@ def main():
     parser.add_argument("-dropout", type=float, default=0.0)
     parser.add_argument("-epsilon", type=float, default=1e-5)
     parser.add_argument("-no_cuda", action="store_true")
+    parser.add_argument("-zero_shot", type=int, default=0)
+    parser.add_argument("-batchsize", type=int, default=1)
+    parser.add_argument("-epochs", type=int, default=1)
+    parser.add_argument("-lr", type=float, default=0.00001)
+
 
     opt = parser.parse_args()
-    
-    obqa_train = read_obqa('obqa/obqa.train.txt')
-    obqa_test = read_obqa('obqa/obqa.test.txt')
-    obqa_valid = read_obqa('obqa/obqa.valid.txt')
+    opt.zero_shot = False if opt.zero_shot == 0 else True
+    opt.train = read_obqa('obqa/obqa.train.txt')
+    opt.test = read_obqa('obqa/obqa.test.txt')
+    opt.valid = read_obqa('obqa/obqa.valid.txt')
 
     if opt.eval_seqlen is None:
         opt.eval_seqlen = opt.seqlen
-
+  
     device = torch.device("cuda:0" if torch.cuda.is_available() and not opt.no_cuda else "cpu")
 
     tokenizer = GPT2TokenizerFast.from_pretrained(opt.tokenizer_dir)
-    tokenizer.model_max_length = 10**9
+    opt.tokenizer = tokenizer
+    opt.device = device
+
+    #precompute embeddings
+    Tokenize(opt)
 
     state_dict = load_model_best_state_dict(opt.loadname)
     vocab_size = int(state_dict["wte.weight"].shape[0])
@@ -273,11 +406,19 @@ def main():
     model = TransformerGPT(vocab_size, opt.d_model, opt.n_layers, opt.heads, opt.seqlen, opt.d_ff, 
                            opt.dropout, opt.epsilon)
     model.load_state_dict(state_dict, strict=True)
+    opt.optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr, betas=(0.9, 0.98), eps=1e-9)
+
+    torch.cuda.empty_cache()
     model.to(device)
     model.eval()
 
-    indices = my_tokenizer(opt.valid_file,tokenizer,1000000)
-    ppl = test_model(model=model, indices=indices, opt=opt, epoch=0, device=device)
+    train(model,opt)
+
+    accuracy = test(model, opt)
+    print("Test set accuracy is:", accuracy)
+
+    # indices = my_tokenizer(opt.valid_file,tokenizer,1000000)
+    # ppl = test_model(model=model, indices=indices, opt=opt, epoch=0, device=device)
 
 if __name__ == "__main__":
     main()

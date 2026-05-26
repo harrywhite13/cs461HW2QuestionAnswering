@@ -1,3 +1,4 @@
-BertQAweights/model_weights_61.pt
-BertQAweights/model_weights_zero_shot_51.pt
+BertQAweights/*
+GPTQAweights/*
 saved/*
+Homework #2.pdf
