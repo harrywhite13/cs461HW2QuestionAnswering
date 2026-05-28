@@ -407,6 +407,7 @@ class BeamTree(object):
                 probs, ids = self.getnexttokens(node.tokensequence)
                 for prob, id in zip(probs, ids):
                     newnodes.append(BeamNode(logprob=(node.logprob + prob.item()), tokensequence=(node.tokensequence + [id.item()]), depth=node.depth+1))
+            #pruning worst beams
             newnodes.sort(key=lambda node: node.logprob)
             self.activenodes = newnodes[-self.numbeams:]
             return True
@@ -427,6 +428,7 @@ def Bertscore(choice, gen):
     similarity = torch.matmul(choice, gen.T)
     precision = similarity.max(dim=0).values.mean()
     recall = similarity.max(dim=1).values.mean()
+    #f1score
     return 2 * precision * recall / (precision + recall)
 
 def test_generative(model,opt,validation=False):
@@ -439,6 +441,7 @@ def test_generative(model,opt,validation=False):
     examples = {"correct": [], "incorrect": []}
     for questionidx in tdqm(range(0,len(exs))):
         question = exs[questionidx]
+        #extract legnth of stem tokens
         stemendidx = question[0][0]
         stem = question[0][1:stemendidx]
         choices = [torch.tensor(choice[choice[0]:]) for choice in question]
@@ -454,6 +457,7 @@ def test_generative(model,opt,validation=False):
                 scores.append(Bertscore(choiceembed[choicemask.bool()],embeddings[stemendidx:]))
         pred = torch.argmax(torch.stack(scores)).item()
         if pred==alllabels[questionidx]:
+            #asembling the correct and incorrect examples
             if correct<5:
                 answer = {"stem": opt.tokenizer.decode(stem),
                         "generation": opt.tokenizer.decode(gen[stemendidx:]),
