@@ -174,7 +174,7 @@ def Tokenize(opt):
                 tokenized.append(text + answerchoice)
             #tokenize
             label = np.argmax([1 if x == question['Answer'] else 0 for x in ["A", "B", "C", "D"]])
-            
+
             if cnt==0:
                 opt.train_tokenized.append(tokenized)
                 opt.train_labels.append(label)
@@ -304,7 +304,7 @@ def train(model, opt):
                 #compute loss
                 token_log_probs = -F.cross_entropy(logits.reshape(-1, logits.size(-1)),labels.reshape(-1),reduction='none').view(labels.shape)
                 positions = torch.arange(token_log_probs.size(1), device=opt.device).unsqueeze(0)
-                mask = (positions >= (choicestart.unsqueeze(1) - 1)).float() 
+                mask = (positions >= (choicestart.unsqueeze(1) - 1)).float()
                 token_log_probs = token_log_probs * mask
                 choice_scores = token_log_probs.sum(dim=1)/mask.sum(dim=1)
                 choice_scores = choice_scores.view(len(batch_examples), 4)
@@ -352,17 +352,130 @@ def test(model, opt, validation = False):
                 labels = input_ids[:, 1:]
                 token_log_probs = -F.cross_entropy(logits.reshape(-1, logits.size(-1)),labels.reshape(-1),reduction='none',).view(labels.shape)
                 positions = torch.arange(token_log_probs.size(1), device=opt.device).unsqueeze(0)
-                mask = (positions >= (choicestart.unsqueeze(1) - 1)).float() 
+                mask = (positions >= (choicestart.unsqueeze(1) - 1)).float()
                 token_log_probs = token_log_probs * mask
                 choice_scores = token_log_probs.sum(dim=1)/mask.sum(dim=1)
                 choice_scores = choice_scores.view(len(batch_examples), 4)
                 preds = choice_scores.argmax(dim=1)
-                correct+=(preds==batch_labels).sum().item()            
+                correct+=(preds==batch_labels).sum().item()
     return correct/len(alllabels)
+
+#PART 3
+class BeamNode(object):
+    def __init__(self, logprob, tokensequence, depth):
+        self.logprob = logprob
+        self.tokensequence = tokensequence
+        self.children = []
+        self.depth = depth
+
+class BeamTree(object):
+    def __init__(self, model, stem, opt):
+        self.activenodes = []
+        self.root = BeamNode(logprob=0.0, depth=0, tokensequence=stem)
+        self.model = model
+        self.numbeams = opt.numbeams
+        self.maxdepth = opt.beamlength
+        self.activenodes = []
+        self.temperature = opt.temperature
+        self.device = opt.device
+        self.repetition_penalty = opt.repetition_penalty
+    def getnexttokens(self, tokenseq):
+        with torch.no_grad():
+            tokenseq = torch.tensor(tokenseq, device=self.device).unsqueeze(0)
+            attention_mask = (tokenseq != 0).long()
+            x,logits = self.model(tokenseq, attention_mask=attention_mask)
+            #adj for temp
+            log_probs = F.log_softmax(logits[:, -1, :] / self.temperature, dim=-1)
+            for token in tokenseq:
+                log_probs[0, token] /= self.repetition_penalty
+            topk_log_probs, topk_ids = torch.topk(log_probs, k=self.numbeams)
+            return topk_log_probs.squeeze(0), topk_ids.squeeze(0)
+
+    def genbeams(self):
+        #initial generation (working on root node)
+        if not self.activenodes:
+            probs, ids = self.getnexttokens(self.root.tokensequence)
+            for prob, id in zip(probs, ids):
+                self.activenodes.append(BeamNode(logprob=prob.item(), tokensequence=(self.root.tokensequence + [id.item()]), depth=1))
+            return True
+        #hit max depth -> stop gen
+        elif self.activenodes[0].depth == self.maxdepth:
+            return False
+        else:
+            newnodes = []
+            for node in self.activenodes:
+                probs, ids = self.getnexttokens(node.tokensequence)
+                for prob, id in zip(probs, ids):
+                    newnodes.append(BeamNode(logprob=(node.logprob + prob.item()), tokensequence=(node.tokensequence + [id.item()]), depth=node.depth+1))
+            newnodes.sort(key=lambda node: node.logprob)
+            self.activenodes = newnodes[-self.numbeams:]
+            return True
+    def buildtree(self):
+        gen = True
+        while gen:
+            gen = self.genbeams()
+        #ret top beam/sequence
+        bestseq = torch.tensor(self.activenodes[-1].tokensequence,device=self.device).unsqueeze(0)
+        attention_mask = (bestseq != 0).long()
+        with torch.no_grad():
+            embedding, _ = self.model(bestseq, attention_mask=attention_mask)
+        return self.activenodes[-1].tokensequence, embedding.squeeze(0)
+
+def Bertscore(choice, gen):
+    choice = F.normalize(choice, p=2, dim=-1)
+    gen = F.normalize(gen, p=2, dim=-1)
+    similarity = torch.matmul(choice, gen.T)
+    precision = similarity.max(dim=0).values.mean()
+    recall = similarity.max(dim=1).values.mean()
+    return 2 * precision * recall / (precision + recall)
+
+def test_generative(model,opt,validation=False):
+    correct = 0
+    incorrect = 0
+
+    exs = opt.valid_tokenized if validation else opt.test_tokenized
+    alllabels = opt.valid_labels if validation else opt.test_labels
+
+    examples = {"correct": [], "incorrect": []}
+    for questionidx in tdqm(range(0,len(exs))):
+        question = exs[questionidx]
+        stemendidx = question[0][0]
+        stem = question[0][1:stemendidx]
+        choices = [torch.tensor(choice[choice[0]:]) for choice in question]
+        tree = BeamTree(model=model,stem=stem, opt=opt)
+        gen, embeddings = tree.buildtree()
+        #get choice embeddings
+        input_ids = torch.nn.utils.rnn.pad_sequence(choices, batch_first=True, padding_value=0).to(opt.device)
+        attention_mask = (input_ids != 0).long()
+        scores = []
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16,):
+            x, _ = model(input_ids, attention_mask=attention_mask)
+            for choiceembed, choicemask in zip(x, attention_mask):
+                scores.append(Bertscore(choiceembed[choicemask.bool()],embeddings[stemendidx:]))
+        pred = torch.argmax(torch.stack(scores)).item()
+        if pred==alllabels[questionidx]:
+            if correct<5:
+                answer = {"stem": opt.tokenizer.decode(stem),
+                        "generation": opt.tokenizer.decode(gen[stemendidx:]),
+                        "choices": [(opt.tokenizer.decode(choices[choiceidx]), scores[choiceidx].item()) for choiceidx in range(len(choices))],
+                        "Correct answer choice": opt.tokenizer.decode(choices[alllabels[questionidx]].tolist())
+                            }
+                examples["correct"].append(answer)
+            correct +=1
+        elif incorrect < 5:
+            incorrect+=1
+            answer = {"stem": opt.tokenizer.decode(stem),
+                        "generation": opt.tokenizer.decode(gen[stemendidx:]),
+                        "choices": [(opt.tokenizer.decode(choices[choiceidx]), scores[choiceidx].item()) for choiceidx in range(len(choices))],
+                        "Correct answer choice": opt.tokenizer.decode(choices[alllabels[questionidx]].tolist())
+                            }
+            examples["incorrect"].append(answer)
+    return correct/(len(alllabels)), examples
+
+        
 
 def main():
     parser = argparse.ArgumentParser()
-
     parser.add_argument("-loadname", type=str, default="")
     parser.add_argument("-valid_file", type=str, default="")
     parser.add_argument("-tokenizer_dir", type=str, default="")
@@ -376,21 +489,29 @@ def main():
     parser.add_argument("-dropout", type=float, default=0.0)
     parser.add_argument("-epsilon", type=float, default=1e-5)
     parser.add_argument("-no_cuda", action="store_true")
+    #part 2 training
     parser.add_argument("-zero_shot", type=int, default=0)
     parser.add_argument("-batchsize", type=int, default=1)
     parser.add_argument("-epochs", type=int, default=1)
     parser.add_argument("-lr", type=float, default=0.00001)
-
+    #part 3 params
+    parser.add_argument("-generativeanswering", type=int, default=0)
+    parser.add_argument("-numbeams", type=int, default=1)
+    parser.add_argument("-beamlength", type=int, default=1)
+    parser.add_argument("-temperature", type=float, default=1.0)
+    parser.add_argument("-repetition_penalty", type=float, default=1.0)
 
     opt = parser.parse_args()
     opt.zero_shot = False if opt.zero_shot == 0 else True
+    generative = False if opt.generativeanswering == 0 else True
+
     opt.train = read_obqa('obqa/obqa.train.txt')
     opt.test = read_obqa('obqa/obqa.test.txt')
     opt.valid = read_obqa('obqa/obqa.valid.txt')
 
     if opt.eval_seqlen is None:
         opt.eval_seqlen = opt.seqlen
-  
+
     device = torch.device("cuda:0" if torch.cuda.is_available() and not opt.no_cuda else "cpu")
 
     tokenizer = GPT2TokenizerFast.from_pretrained(opt.tokenizer_dir)
@@ -403,19 +524,28 @@ def main():
     state_dict = load_model_best_state_dict(opt.loadname)
     vocab_size = int(state_dict["wte.weight"].shape[0])
 
-    model = TransformerGPT(vocab_size, opt.d_model, opt.n_layers, opt.heads, opt.seqlen, opt.d_ff, 
+    model = TransformerGPT(vocab_size, opt.d_model, opt.n_layers, opt.heads, opt.seqlen, opt.d_ff,
                            opt.dropout, opt.epsilon)
     model.load_state_dict(state_dict, strict=True)
-    opt.optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr, betas=(0.9, 0.98), eps=1e-9)
 
     torch.cuda.empty_cache()
     model.to(device)
     model.eval()
+    model.train()
+    #part 2 (decoder only training)
+    if not generative:
+        opt.optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr, betas=(0.9, 0.98), eps=1e-9)
+        train(model,opt)
+        accuracy = test(model, opt)
+        print("Test set accuracy for decoder only is: ", accuracy)
 
-    train(model,opt)
-
-    accuracy = test(model, opt)
-    print("Test set accuracy is:", accuracy)
+    #part 3 (load the finetune from part 2)
+    else:
+        accuracy, examples = test_generative(model, opt, validation=True)
+        print("Validtion set accuract for generative -> berstscore classification is: ", accuracy)
+        accuracy, examples = test_generative(model, opt, validation=False)
+        print("Test set accuract for generative -> berstscore classification is: ", accuracy)
+        print("generation examples are", examples)
 
     # indices = my_tokenizer(opt.valid_file,tokenizer,1000000)
     # ppl = test_model(model=model, indices=indices, opt=opt, epoch=0, device=device)
